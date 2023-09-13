@@ -301,6 +301,7 @@ namespace tcpp
 		public:
 			using TOnErrorCallback = std::function<void(const TErrorInfo&)>;
 			using TOnIncludeCallback = std::function<TInputStreamUniquePtr(const std::string&, bool)>;
+			using TOnPopIncludeCallback = std::function<void()>;
 			using TSymTable = std::vector<TMacroDesc>;
 			using TContextStack = std::list<std::string>;
 			using TDirectiveHandler = std::function<std::string(Preprocessor&, Lexer&, const std::string&)>;
@@ -310,7 +311,7 @@ namespace tcpp
 			{
 				TOnErrorCallback   mOnErrorCallback = {};
 				TOnIncludeCallback mOnIncludeCallback = {};
-
+				TOnPopIncludeCallback mOnPopIncludeCallback = {};
 				bool               mSkipComments = false; ///< When it's true all tokens which are E_TOKEN_TYPE::COMMENTARY will be thrown away from preprocessor's output
 			} TPreprocessorConfigInfo, * TPreprocessorConfigInfoPtr;
 
@@ -361,7 +362,7 @@ namespace tcpp
 
 			TOnErrorCallback   mOnErrorCallback;
 			TOnIncludeCallback mOnIncludeCallback;
-
+			TOnPopIncludeCallback mOnPopIncludeCallback;
 			TSymTable mSymTable;
 			mutable TContextStack mContextStack;
 			TIfStack mConditionalBlocksStack;
@@ -1036,7 +1037,6 @@ namespace tcpp
 		return mStreamsContext.empty() ? nullptr : mStreamsContext.top().get();
 	}
 
-
 	static const std::vector<std::string> BuiltInDefines
 	{
 		"__LINE__",
@@ -1044,7 +1044,7 @@ namespace tcpp
 
 
 	Preprocessor::Preprocessor(Lexer& lexer, const TPreprocessorConfigInfo& config) TCPP_NOEXCEPT:
-		mpLexer(&lexer), mOnErrorCallback(config.mOnErrorCallback), mOnIncludeCallback(config.mOnIncludeCallback), mSkipCommentsTokens(config.mSkipComments)
+		mpLexer(&lexer), mOnErrorCallback(config.mOnErrorCallback), mOnIncludeCallback(config.mOnIncludeCallback), mOnPopIncludeCallback(config.mOnPopIncludeCallback), mSkipCommentsTokens(config.mSkipComments)
 	{
 		for (auto&& currSystemDefine : BuiltInDefines)
 		{
@@ -1194,6 +1194,8 @@ namespace tcpp
 
 			if (!mpLexer->HasNextToken())
 			{
+				if (mOnPopIncludeCallback)
+					mOnPopIncludeCallback();
 				mpLexer->PopStream();
 			}
 		}
