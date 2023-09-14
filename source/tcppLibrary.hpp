@@ -43,6 +43,7 @@
 #include <unordered_map>
 #include <cctype>
 #include <sstream>
+#include <memory>
 
 
 ///< Library's configs
@@ -78,10 +79,13 @@ namespace tcpp
 			virtual bool HasNextLine() const TCPP_NOEXCEPT = 0;
 	};
 
+	
+	using TInputStreamUniquePtr = std::unique_ptr<IInputStream>;
+
 
 	/*!
 		class StringInputStream
-
+		
 		\brief The class is the simplest implementation of the input stream, which
 		is a simple string
 	*/
@@ -145,6 +149,7 @@ namespace tcpp
 		LE,
 		EQ,
 		NE,
+		SEMICOLON,
 		CUSTOM_DIRECTIVE,
 		COMMENTARY,
 		UNKNOWN,
@@ -178,28 +183,38 @@ namespace tcpp
 	{
 		private:
 			using TTokensQueue = std::list<TToken>;
-			using TStreamStack = std::stack<IInputStream*>;
+			using TStreamStack = std::stack<TInputStreamUniquePtr>;
 			using TDirectivesMap = std::vector<std::tuple<std::string, E_TOKEN_TYPE>>;
 			using TDirectiveHandlersArray = std::unordered_set<std::string>;
 		public:
 			Lexer() TCPP_NOEXCEPT = delete;
-			explicit Lexer(IInputStream& inputStream) TCPP_NOEXCEPT;
+			explicit Lexer(TInputStreamUniquePtr pIinputStream) TCPP_NOEXCEPT;
 			~Lexer() TCPP_NOEXCEPT = default;
 
 			bool AddCustomDirective(const std::string& directive) TCPP_NOEXCEPT; 
 
 			TToken GetNextToken() TCPP_NOEXCEPT;
 
+			/*!
+				\brief The method allows to peek token without changing current pointer
+
+				\param[in] offset Distance of overlooking, passing 0 is equivalent to invoking GetNextToken()
+			*/
+
+			TToken PeekNextToken(size_t offset = 1);
+
 			bool HasNextToken() const TCPP_NOEXCEPT;
 
 			void AppendFront(const std::vector<TToken>& tokens) TCPP_NOEXCEPT;
 
-			void PushStream(IInputStream& stream) TCPP_NOEXCEPT;
+			void PushStream(TInputStreamUniquePtr stream) TCPP_NOEXCEPT;
 			void PopStream() TCPP_NOEXCEPT;
 
 			size_t GetCurrLineIndex() const TCPP_NOEXCEPT;
 			size_t GetCurrPos() const TCPP_NOEXCEPT;
 		private:
+			TToken _getNextTokenInternal(bool ignoreQueue) TCPP_NOEXCEPT;
+
 			TToken _scanTokens(std::string& inputLine) TCPP_NOEXCEPT;
 
 			std::string _requestSourceLine() TCPP_NOEXCEPT;
@@ -285,12 +300,20 @@ namespace tcpp
 	{
 		public:
 			using TOnErrorCallback = std::function<void(const TErrorInfo&)>;
-			using TOnIncludeCallback = std::function<IInputStream*(const std::string&, bool)>;
+			using TOnIncludeCallback = std::function<TInputStreamUniquePtr(const std::string&, bool)>;
 			using TOnPopIncludeCallback = std::function<void()>;
 			using TSymTable = std::vector<TMacroDesc>;
 			using TContextStack = std::list<std::string>;
 			using TDirectiveHandler = std::function<std::string(Preprocessor&, Lexer&, const std::string&)>;
 			using TDirectivesMap = std::unordered_map<std::string, TDirectiveHandler>;
+
+			typedef struct TPreprocessorConfigInfo
+			{
+				TOnErrorCallback   mOnErrorCallback = {};
+				TOnIncludeCallback mOnIncludeCallback = {};
+				TOnPopIncludeCallback mOnPopIncludeCallback = {};
+				bool               mSkipComments = false; ///< When it's true all tokens which are E_TOKEN_TYPE::COMMENTARY will be thrown away from preprocessor's output
+			} TPreprocessorConfigInfo, * TPreprocessorConfigInfoPtr;
 
 			typedef struct TIfStackEntry
 			{
@@ -305,7 +328,7 @@ namespace tcpp
 		public:
 			Preprocessor() TCPP_NOEXCEPT = delete;
 			Preprocessor(const Preprocessor&) TCPP_NOEXCEPT = delete;
-			Preprocessor(Lexer& lexer, const TOnErrorCallback& onErrorCallback = {}, const TOnIncludeCallback& onIncludeCallback = {}, const TOnPopIncludeCallback& onPopIncludeCallback = {}) TCPP_NOEXCEPT;
+			Preprocessor(Lexer& lexer, const TPreprocessorConfigInfo& config) TCPP_NOEXCEPT;
 			~Preprocessor() TCPP_NOEXCEPT = default;
 
 			bool AddCustomDirectiveHandler(const std::string& directive, const TDirectiveHandler& handler) TCPP_NOEXCEPT;
@@ -319,7 +342,7 @@ namespace tcpp
 			void _createMacroDefinition() TCPP_NOEXCEPT;
 			void _removeMacroDefinition(const std::string& macroName) TCPP_NOEXCEPT;
 
-			std::vector<TToken> _expandMacroDefinition(const TMacroDesc& macroDesc, const TToken& idToken) TCPP_NOEXCEPT;
+			std::vector<TToken> _expandMacroDefinition(const TMacroDesc& macroDesc, const TToken& idToken, const std::function<TToken()>& getNextTokenCallback) const TCPP_NOEXCEPT;
 
 			void _expect(const E_TOKEN_TYPE& expectedType, const E_TOKEN_TYPE& actualType) const TCPP_NOEXCEPT;
 
@@ -336,13 +359,16 @@ namespace tcpp
 			bool _shouldTokenBeSkipped() const TCPP_NOEXCEPT;
 		private:
 			Lexer* mpLexer;
-			TOnErrorCallback mOnErrorCallback;
+
+			TOnErrorCallback   mOnErrorCallback;
 			TOnIncludeCallback mOnIncludeCallback;
 			TOnPopIncludeCallback mOnPopIncludeCallback;
 			TSymTable mSymTable;
-			TContextStack mContextStack;
+			mutable TContextStack mContextStack;
 			TIfStack mConditionalBlocksStack;
 			TDirectivesMap mCustomDirectivesHandlersMap;
+
+			bool mSkipCommentsTokens;
 	};
 
 
@@ -416,7 +442,7 @@ namespace tcpp
 
 	const TToken Lexer::mEOFToken = { E_TOKEN_TYPE::END };
 
-	Lexer::Lexer(IInputStream& inputStream) TCPP_NOEXCEPT:
+	Lexer::Lexer(TInputStreamUniquePtr pIinputStream) TCPP_NOEXCEPT:
 		mDirectivesTable
 		{
 			{ "define", E_TOKEN_TYPE::DEFINE },
@@ -431,7 +457,7 @@ namespace tcpp
 			{ "defined", E_TOKEN_TYPE::DEFINED },
 		}, mCurrLine(), mCurrLineIndex(0)
 	{
-		PushStream(inputStream);
+		PushStream(std::move(pIinputStream));
 	}
 
 	bool Lexer::AddCustomDirective(const std::string& directive) TCPP_NOEXCEPT
@@ -447,24 +473,28 @@ namespace tcpp
 
 	TToken Lexer::GetNextToken() TCPP_NOEXCEPT
 	{
-		if (!mTokensQueue.empty())
-		{
-			auto currToken = mTokensQueue.front();
-			mTokensQueue.pop_front();
+		return _getNextTokenInternal(false);
+	}
 
-			return currToken;
+	TToken Lexer::PeekNextToken(size_t offset)
+	{
+		if (!mTokensQueue.empty() && offset < mTokensQueue.size())
+		{
+			return *std::next(mTokensQueue.begin(), offset);
 		}
 
-		if (mCurrLine.empty())
+		const size_t count = offset - mTokensQueue.size();
+		for (size_t i = 0; i < count; i++)
 		{
-			// \note if it's still empty then we've reached the end of the source
-			if ((mCurrLine = _requestSourceLine()).empty())
-			{
-				return mEOFToken;
-			}
+			mTokensQueue.push_back(_getNextTokenInternal(true));
 		}
 
-		return _scanTokens(mCurrLine);
+		if (mTokensQueue.empty())
+		{
+			return GetNextToken();
+		}
+
+		return mTokensQueue.back();
 	}
 
 	bool Lexer::HasNextToken() const TCPP_NOEXCEPT
@@ -478,9 +508,16 @@ namespace tcpp
 		mTokensQueue.insert(mTokensQueue.begin(), tokens.begin(), tokens.end());
 	}
 
-	void Lexer::PushStream(IInputStream& stream) TCPP_NOEXCEPT
+	void Lexer::PushStream(TInputStreamUniquePtr stream) TCPP_NOEXCEPT
 	{
-		mStreamsContext.push(&stream);
+		TCPP_ASSERT(stream);
+
+		if (!stream)
+		{
+			return;
+		}
+
+		mStreamsContext.push(std::move(stream));
 	}
 
 	void Lexer::PopStream() TCPP_NOEXCEPT
@@ -543,6 +580,12 @@ namespace tcpp
 				commentStr.push_back(input.front());
 				input.erase(0, 1);
 
+				if (input.rfind("//", 0) == 0)
+				{
+					commentStr.append(input.substr(0, 2));
+					input.erase(0, 2);
+				}
+
 				if (input.rfind("/*", 0) == 0)
 				{
 					input = enterCommentBlock(input);
@@ -575,6 +618,28 @@ namespace tcpp
 	}
 
 
+	TToken Lexer::_getNextTokenInternal(bool ignoreQueue) TCPP_NOEXCEPT
+	{
+		if (!ignoreQueue && !mTokensQueue.empty())
+		{
+			auto currToken = mTokensQueue.front();
+			mTokensQueue.pop_front();
+
+			return currToken;
+		}
+
+		if (mCurrLine.empty())
+		{
+			// \note if it's still empty then we've reached the end of the source
+			if ((mCurrLine = _requestSourceLine()).empty())
+			{
+				return mEOFToken;
+			}
+		}
+
+		return _scanTokens(mCurrLine);
+	}
+
 	TToken Lexer::_scanTokens(std::string& inputLine) TCPP_NOEXCEPT
 	{
 		char ch = '\0';
@@ -591,7 +656,7 @@ namespace tcpp
 			"do", "if", "static", "while"
 		};
 
-		static const std::string separators = ",()<>\"+-*/&|!=";
+		static const std::string separators = ",()<>\"+-*/&|!=;";
 
 		std::string currStr = "";
 
@@ -654,14 +719,21 @@ namespace tcpp
 					return { E_TOKEN_TYPE::BLOB, currStr, mCurrLineIndex, mCurrPos };
 				}
 
+				/// \note Skip whitespaces if there're exist
+				do
+				{
+					mCurrPos = std::get<size_t>(EatNextChar(inputLine, mCurrPos));
+				} 
+				while (std::isspace(PeekNextChar(inputLine, 0)));
+
 				for (const auto& currDirective : mDirectivesTable)
 				{
 					auto&& currDirectiveStr = std::get<std::string>(currDirective);
 
-					if (inputLine.rfind(currDirectiveStr, 1) == 1)
+					if (inputLine.rfind(currDirectiveStr, 0) == 0)
 					{
-						inputLine.erase(0, currDirectiveStr.length() + 1);
-						mCurrPos += currDirectiveStr.length() + 1;
+						inputLine.erase(0, currDirectiveStr.length());
+						mCurrPos += currDirectiveStr.length();
 
 						return { std::get<E_TOKEN_TYPE>(currDirective), "", mCurrLineIndex, mCurrPos };
 					}
@@ -670,16 +742,14 @@ namespace tcpp
 				// \note custom directives
 				for (const auto& currDirectiveStr : mCustomDirectivesMap)
 				{
-					if (inputLine.rfind(currDirectiveStr, 1) == 1)
+					if (inputLine.rfind(currDirectiveStr, 0) == 0)
 					{
-						inputLine.erase(0, currDirectiveStr.length() + 1);
-						mCurrPos += currDirectiveStr.length() + 1;
+						inputLine.erase(0, currDirectiveStr.length());
+						mCurrPos += currDirectiveStr.length();
 
 						return { E_TOKEN_TYPE::CUSTOM_DIRECTIVE, currDirectiveStr, mCurrLineIndex, mCurrPos };
 					}
 				}
-
-				inputLine.erase(0, 1);
 
 				// \note if we've reached this line it's # operator not directive
 				if (!inputLine.empty())
@@ -954,6 +1024,9 @@ namespace tcpp
 				}
 
 				return { E_TOKEN_TYPE::BLOB, "=", mCurrLineIndex, mCurrPos };
+
+			case ';':
+				return { E_TOKEN_TYPE::SEMICOLON, ";", mCurrLineIndex, mCurrPos };
 		}
 
 		return mEOFToken;
@@ -961,13 +1034,22 @@ namespace tcpp
 
 	IInputStream* Lexer::_getActiveStream() const TCPP_NOEXCEPT
 	{
-		return mStreamsContext.empty() ? nullptr : mStreamsContext.top();
+		return mStreamsContext.empty() ? nullptr : mStreamsContext.top().get();
 	}
 
-	Preprocessor::Preprocessor(Lexer& lexer, const TOnErrorCallback& onErrorCallback, const TOnIncludeCallback& onIncludeCallback, const TOnPopIncludeCallback& onPopIncludeCallback) TCPP_NOEXCEPT:
-		mpLexer(&lexer), mOnErrorCallback(onErrorCallback), mOnIncludeCallback(onIncludeCallback), mOnPopIncludeCallback(onPopIncludeCallback)
+	static const std::vector<std::string> BuiltInDefines
 	{
-		mSymTable.push_back({ "__LINE__" });
+		"__LINE__",
+	};
+
+
+	Preprocessor::Preprocessor(Lexer& lexer, const TPreprocessorConfigInfo& config) TCPP_NOEXCEPT:
+		mpLexer(&lexer), mOnErrorCallback(config.mOnErrorCallback), mOnIncludeCallback(config.mOnIncludeCallback), mOnPopIncludeCallback(config.mOnPopIncludeCallback), mSkipCommentsTokens(config.mSkipComments)
+	{
+		for (auto&& currSystemDefine : BuiltInDefines)
+		{
+			mSymTable.push_back({ currSystemDefine });
+		}
 	}
 
 	bool Preprocessor::AddCustomDirectiveHandler(const std::string& directive, const TDirectiveHandler& handler) TCPP_NOEXCEPT
@@ -1060,7 +1142,7 @@ namespace tcpp
 
 						if (iter != mSymTable.cend() && contextIter == mContextStack.cend())
 						{
-							mpLexer->AppendFront(_expandMacroDefinition(*iter, currToken));
+							mpLexer->AppendFront(_expandMacroDefinition(*iter, currToken, [this] { return mpLexer->GetNextToken(); }));
 						}
 						else
 						{
@@ -1101,6 +1183,11 @@ namespace tcpp
 					}
 					break;
 				default:
+					if (E_TOKEN_TYPE::COMMENTARY == currToken.mType && mSkipCommentsTokens)
+					{
+						break;
+					}
+
 					appendString(currToken.mRawView);
 					break;
 			}
@@ -1164,6 +1251,7 @@ namespace tcpp
 				extractValue(macroDesc, *mpLexer);
 				break;
 			case E_TOKEN_TYPE::NEWLINE:
+			case E_TOKEN_TYPE::END:
 				macroDesc.mValue.push_back({ E_TOKEN_TYPE::NUMBER, "1", mpLexer->GetCurrLineIndex() });
 				break;
 			case E_TOKEN_TYPE::OPEN_BRACKET: // function line macro
@@ -1228,14 +1316,14 @@ namespace tcpp
 		_expect(E_TOKEN_TYPE::NEWLINE, currToken.mType);
 	}
 
-	std::vector<TToken> Preprocessor::_expandMacroDefinition(const TMacroDesc& macroDesc, const TToken& idToken) TCPP_NOEXCEPT
+	std::vector<TToken> Preprocessor::_expandMacroDefinition(const TMacroDesc& macroDesc, const TToken& idToken, const std::function<TToken()>& getNextTokenCallback) const TCPP_NOEXCEPT
 	{
 		// \note expand object like macro with simple replacement
 		if (macroDesc.mArgsNames.empty())
 		{
 			static const std::unordered_map<std::string, std::function<TToken()>> systemMacrosTable
 			{
-				{ "__LINE__", [&idToken]() { return TToken { E_TOKEN_TYPE::BLOB, std::to_string(idToken.mLineId) }; } }
+				{ BuiltInDefines[0], [&idToken]() { return TToken {E_TOKEN_TYPE::BLOB, std::to_string(idToken.mLineId)}; }} // __LINE__
 			};
 
 			auto iter = systemMacrosTable.find(macroDesc.mName);
@@ -1250,7 +1338,9 @@ namespace tcpp
 		mContextStack.push_back(macroDesc.mName);
 
 		// \note function like macro's case
-		auto currToken = mpLexer->GetNextToken();
+		auto currToken = getNextTokenCallback();
+
+		while (currToken.mType == E_TOKEN_TYPE::SPACE) { currToken = getNextTokenCallback(); } // \note skip space tokens
 		_expect(E_TOKEN_TYPE::OPEN_BRACKET, currToken.mType);
 
 		std::vector<std::vector<TToken>> processingTokens;
@@ -1263,10 +1353,10 @@ namespace tcpp
 		{
 			currArgTokens.clear();
 
-			while ((currToken = mpLexer->GetNextToken()).mType == E_TOKEN_TYPE::SPACE); // \note skip space tokens
+			while ((currToken = getNextTokenCallback()).mType == E_TOKEN_TYPE::SPACE); // \note skip space tokens
 			currArgTokens.push_back({ currToken });
 
-			while ((currToken = mpLexer->GetNextToken()).mType == E_TOKEN_TYPE::SPACE);
+			while ((currToken = getNextTokenCallback()).mType == E_TOKEN_TYPE::SPACE);
 			
 			while ((currToken.mType != E_TOKEN_TYPE::COMMA &&
 				   currToken.mType != E_TOKEN_TYPE::NEWLINE &&
@@ -1283,7 +1373,7 @@ namespace tcpp
 				}
 
 				currArgTokens.push_back({ currToken });
-				currToken = mpLexer->GetNextToken();
+				currToken = getNextTokenCallback();
 			}
 
 			if (currToken.mType != E_TOKEN_TYPE::COMMA && currToken.mType != E_TOKEN_TYPE::CLOSE_BRACKET)
@@ -1388,16 +1478,16 @@ namespace tcpp
 		}
 
 		while ((currToken = mpLexer->GetNextToken()).mType == E_TOKEN_TYPE::SPACE);
-		_expect(E_TOKEN_TYPE::NEWLINE, currToken.mType);
-
-		IInputStream* pInputStream = mOnIncludeCallback(path, isSystemPathInclusion);
-		if (!pInputStream)
+		
+		if (E_TOKEN_TYPE::NEWLINE != currToken.mType && E_TOKEN_TYPE::END != currToken.mType)
 		{
-			TCPP_ASSERT(false);
-			return;
+			mOnErrorCallback({ E_ERROR_TYPE::UNEXPECTED_TOKEN, mpLexer->GetCurrLineIndex() });
 		}
 
-		mpLexer->PushStream(*pInputStream);
+		if (mOnIncludeCallback)
+		{
+			mpLexer->PushStream(std::move(mOnIncludeCallback(path, isSystemPathInclusion)));
+		}
 	}
 
 	Preprocessor::TIfStackEntry Preprocessor::_processIfConditional() TCPP_NOEXCEPT
@@ -1409,6 +1499,11 @@ namespace tcpp
 
 		while ((currToken = mpLexer->GetNextToken()).mType != E_TOKEN_TYPE::NEWLINE)
 		{
+			if (E_TOKEN_TYPE::SPACE == currToken.mType) 
+			{ 
+				continue; 
+			}
+
 			expressionTokens.push_back(currToken);
 		}
 
@@ -1500,14 +1595,13 @@ namespace tcpp
 		std::vector<TToken> tokens{ exprTokens.begin(), exprTokens.end() };
 		tokens.push_back({ E_TOKEN_TYPE::END });
 
-		// \note use recursive descent parsing technique to evaluate expression
-		auto evalCall = []()
+		auto evalPrimary = [this, &tokens]()
 		{
-			return 0;
-		};
+			while (E_TOKEN_TYPE::SPACE == tokens.front().mType) /// \note Skip whitespaces
+			{
+				tokens.erase(tokens.cbegin());
+			}
 
-		auto evalPrimary = [this, &tokens, &evalCall]()
-		{
 			auto currToken = tokens.front();
 
 			switch (currToken.mType)
@@ -1538,6 +1632,12 @@ namespace tcpp
 							} while (tokens.front().mType == E_TOKEN_TYPE::SPACE);
 
 							_expect(E_TOKEN_TYPE::CLOSE_BRACKET, tokens.front().mType);
+
+							// \note simple identifier
+							return static_cast<int>(std::find_if(mSymTable.cbegin(), mSymTable.cend(), [&identifierToken](auto&& item)
+							{
+								return item.mName == identifierToken.mRawView;
+							}) != mSymTable.cend());
 						}
 						else 
 						{
@@ -1545,16 +1645,40 @@ namespace tcpp
 							identifierToken = currToken;
 						}
 						
-
-						// \note simple identifier
-						return static_cast<int>(std::find_if(mSymTable.cbegin(), mSymTable.cend(), [&identifierToken](auto&& item)
+						/// \note Try to expand macro's value
+						auto it = std::find_if(mSymTable.cbegin(), mSymTable.cend(), [&identifierToken](auto&& item)
 						{
 							return item.mName == identifierToken.mRawView;
-						}) != mSymTable.cend());
+						});
+
+						if (it == mSymTable.cend())
+						{
+							/// \note Lexer for now doesn't support numbers recognition so numbers are recognized as identifiers too
+							return atoi(identifierToken.mRawView.c_str());
+						}
+						else
+						{
+							if (it->mArgsNames.empty())
+							{
+								return _evaluateExpression(it->mValue); /// simple macro replacement
+							}
+
+							/// \note Macro function call so we should firstly expand that one
+							auto currTokenIt = tokens.cbegin();
+							return _evaluateExpression(_expandMacroDefinition(*it, identifierToken, [&currTokenIt] { return *currTokenIt++; }));
+						}
+
+						return 0; /// \note Something went wrong so return 0
 					}
+
 				case E_TOKEN_TYPE::NUMBER:
 					tokens.erase(tokens.cbegin());
 					return std::stoi(currToken.mRawView);
+
+				case E_TOKEN_TYPE::OPEN_BRACKET:
+					tokens.erase(tokens.cbegin());
+					return _evaluateExpression(tokens);
+
 				default:
 					break;
 			}
@@ -1564,6 +1688,11 @@ namespace tcpp
 
 		auto evalUnary = [&tokens, &evalPrimary]()
 		{
+			while (E_TOKEN_TYPE::SPACE == tokens.front().mType) /// \note Skip whitespaces
+			{
+				tokens.erase(tokens.cbegin());
+			}
+
 			bool resultApply = false;
 			TToken currToken;
 			while ((currToken = tokens.front()).mType == E_TOKEN_TYPE::NOT || currToken.mType == E_TOKEN_TYPE::MINUS)
@@ -1590,6 +1719,7 @@ namespace tcpp
 		auto evalMultiplication = [&tokens, &evalUnary]()
 		{
 			int result = evalUnary();
+			int secondOperand = 0;
 
 			TToken currToken;
 			while ((currToken = tokens.front()).mType == E_TOKEN_TYPE::STAR || currToken.mType == E_TOKEN_TYPE::SLASH)
@@ -1602,7 +1732,9 @@ namespace tcpp
 						break;
 					case E_TOKEN_TYPE::SLASH:
 						tokens.erase(tokens.cbegin());
-						result = result / evalUnary();
+						
+						secondOperand = evalUnary();
+						result = secondOperand ? (result / secondOperand) : 0 /* division by zero is considered as false in the implementation */;
 						break;
 					default:
 						break;
@@ -1701,6 +1833,11 @@ namespace tcpp
 		auto evalAndExpr = [&tokens, &evalEquality]()
 		{
 			int result = evalEquality();
+
+			while (E_TOKEN_TYPE::SPACE == tokens.front().mType)
+			{ 
+				tokens.erase(tokens.cbegin());
+			}
 
 			while (tokens.front().mType == E_TOKEN_TYPE::AND)
 			{
